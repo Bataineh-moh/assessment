@@ -4,6 +4,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 
 def find_file(candidates: list[str]) -> Path | None:
@@ -44,8 +46,8 @@ def get_december_inputs() -> pd.DataFrame:
 
 
 def load_datasets():
-    train_path = find_file(["C:\\Users\\DELL\\Desktop\\assessment\\data\\train-test.csv", "train_test.csv"])
-    val_path = find_file(["C:\\Users\\DELL\\Desktop\\assessment\\data\\validation.csv"])
+    train_path = find_file(["train-test.csv", "train_test.csv"])
+    val_path = find_file(["validation.csv"])
 
     if train_path is None:
         raise FileNotFoundError("Could not find train-test.csv in root or data/ folder.")
@@ -101,85 +103,159 @@ def engineer_features(df: pd.DataFrame, city_coords: dict = None) -> tuple[pd.Da
     return data, city_coords
 
 
-def main():
-    train_df, val_df, dec_df = load_datasets()
+TARGET_COL = "posted_rate"
+CAT_COLS = ["pickup", "delivery", "equipment"]
+FEATURE_COLS = [
+    "pickup", "delivery", "equipment", "lane_target_enc",
+    "distance", "log_distance", "weight",
+    "pickup_lat", "pickup_lon", "delivery_lat", "delivery_lon",
+    "month", "day", "dayofweek", "dayofyear", "is_weekend",
+    "sin_dayofyear", "cos_dayofyear",
+    "market_index", "quote_signal",
+]
+CAT_INDICES = [FEATURE_COLS.index(c) for c in CAT_COLS]
 
-    print("\n--- Feature Engineering ---")
-    train_feat, coords = engineer_features(train_df)
-    val_feat, _ = engineer_features(val_df, city_coords=coords)
-    dec_feat, _ = engineer_features(dec_df, city_coords=coords)
+# Heavy regularization: the out-of-fold calendar signal is weak (residual R^2 << 1%),
+# so this keeps the correction a modest nudge instead of fitting holdout noise.
+SEASONAL_RIDGE_ALPHA = 50.0
 
-    target_col = "posted_rate"
 
-    # Smoothed Target Encoding for the high-cardinality lane feature
-    global_mean = train_feat[target_col].mean()
-    lane_stats = train_feat.groupby("lane_name")[target_col].agg(["count", "mean"])
-    smoothing_weight = 10
+def fit_lane_target_encoding(frames: list[pd.DataFrame], target_col: str, smoothing_weight: int = 10) -> None:
+    """Fits smoothed target encoding on frames[0] (the training frame) and applies it to all frames in place."""
+    train_frame = frames[0]
+    global_mean = train_frame[target_col].mean()
+    lane_stats = train_frame.groupby("lane_name")[target_col].agg(["count", "mean"])
     smoothed_lane_rates = (
         (lane_stats["count"] * lane_stats["mean"] + smoothing_weight * global_mean)
         / (lane_stats["count"] + smoothing_weight)
     ).to_dict()
+    for frame in frames:
+        frame["lane_target_enc"] = frame["lane_name"].map(smoothed_lane_rates).fillna(global_mean)
 
-    train_feat["lane_target_enc"] = train_feat["lane_name"].map(smoothed_lane_rates).fillna(global_mean)
-    val_feat["lane_target_enc"] = val_feat["lane_name"].map(smoothed_lane_rates).fillna(global_mean)
-    dec_feat["lane_target_enc"] = dec_feat["lane_name"].map(smoothed_lane_rates).fillna(global_mean)
 
-    # Encode only low-cardinality categoricals: pickup (64), delivery (64), equipment (3)
-    cat_cols = ["pickup", "delivery", "equipment"]
+def fit_categorical_codes(frames: list[pd.DataFrame], cat_cols: list[str]) -> None:
+    """Encodes low-cardinality categoricals using a category set shared across all frames, in place."""
     for col in cat_cols:
-        all_categories = sorted(list(
-            set(train_feat[col].dropna().unique())
-            | set(val_feat[col].dropna().unique())
-            | set(dec_feat[col].dropna().unique())
-        ))
+        all_categories = sorted(set().union(*(set(f[col].dropna().unique()) for f in frames)))
         cat_type = pd.CategoricalDtype(categories=all_categories)
-        train_feat[col] = train_feat[col].astype(cat_type).cat.codes
-        val_feat[col] = val_feat[col].astype(cat_type).cat.codes
-        dec_feat[col] = dec_feat[col].astype(cat_type).cat.codes
+        for frame in frames:
+            frame[col] = frame[col].astype(cat_type).cat.codes
 
-    # Numeric & engineered features
-    feature_cols = [
-        "pickup", "delivery", "equipment", "lane_target_enc",
-        "distance", "log_distance", "weight",
-        "pickup_lat", "pickup_lon", "delivery_lat", "delivery_lon",
-        "month", "day", "dayofweek", "dayofyear", "is_weekend",
-        "sin_dayofyear", "cos_dayofyear",
-        "market_index", "quote_signal",
-    ]
+
+def build_calendar_features(data: pd.DataFrame) -> pd.DataFrame:
+    """Bounded cyclical-only features (day-of-week + day-of-year sin/cos) for the seasonal
+    residual correction. Unlike raw day indices, sin/cos stay in [-1, 1] for any future date,
+    so a linear model on these extrapolates safely past the training date range."""
+    return pd.DataFrame({
+        "sin_dow": np.sin(2 * np.pi * data["dayofweek"] / 7),
+        "cos_dow": np.cos(2 * np.pi * data["dayofweek"] / 7),
+        "sin_doy": data["sin_dayofyear"],
+        "cos_doy": data["cos_dayofyear"],
+    })
+
+
+def compute_regression_metrics(y_true: pd.Series, y_pred: np.ndarray) -> dict:
+    return {
+        "MAE": mean_absolute_error(y_true, y_pred),
+        "RMSE": mean_squared_error(y_true, y_pred) ** 0.5,
+        "R2": r2_score(y_true, y_pred),
+        "MAPE%": float(np.mean(np.abs((y_true - y_pred) / y_true)) * 100),
+    }
+
+
+def make_model() -> HistGradientBoostingRegressor:
+    return HistGradientBoostingRegressor(
+        max_iter=500,
+        learning_rate=0.05,
+        max_depth=8,
+        categorical_features=CAT_INDICES,
+        random_state=42,
+    )
+
+
+def run_temporal_holdout_validation(train_df: pd.DataFrame, target_col: str, holdout_months: int = 2) -> Ridge:
+    """Trains on the earliest months and holds out the most recent ones, mirroring the real
+    task of predicting Nov/Dec from Jan-Oct history. Prints out-of-sample metrics, then fits a
+    small seasonal-correction model on the holdout residuals (see build_calendar_features)."""
+    dates = pd.to_datetime(train_df["date"])
+    months_sorted = sorted(dates.dt.to_period("M").unique())
+    holdout_set = set(months_sorted[-holdout_months:])
+    is_holdout = dates.dt.to_period("M").isin(holdout_set)
+
+    fold_train, fold_coords = engineer_features(train_df.loc[~is_holdout].copy())
+    fold_holdout, _ = engineer_features(train_df.loc[is_holdout].copy(), city_coords=fold_coords)
+
+    fit_lane_target_encoding([fold_train, fold_holdout], target_col)
+    fit_categorical_codes([fold_train, fold_holdout], CAT_COLS)
+
+    model = make_model()
+    model.fit(fold_train[FEATURE_COLS], fold_train[target_col])
+    holdout_pred = np.clip(model.predict(fold_holdout[FEATURE_COLS]), a_min=1.0, a_max=None)
+
+    metrics = compute_regression_metrics(fold_holdout[target_col], holdout_pred)
+    print(
+        f"Holdout = {sorted(str(m) for m in holdout_set)}  "
+        f"(train={len(fold_train):,} rows, holdout={len(fold_holdout):,} rows)"
+    )
+    print(
+        f"MAE=${metrics['MAE']:.2f}  RMSE=${metrics['RMSE']:.2f}  "
+        f"R2={metrics['R2']:.4f}  MAPE={metrics['MAPE%']:.2f}%"
+    )
+
+    residual = fold_holdout[target_col].to_numpy() - holdout_pred
+    seasonal_model = Ridge(alpha=SEASONAL_RIDGE_ALPHA)
+    seasonal_model.fit(build_calendar_features(fold_holdout), residual)
+    return seasonal_model
+
+
+def main():
+    train_df, val_df, dec_df = load_datasets()
+    target_col = TARGET_COL
+
+    print("\n--- Temporal Holdout Validation (train on earlier months, test on most recent months) ---")
+    seasonal_model = run_temporal_holdout_validation(train_df, target_col)
+
+    print("\n--- Feature Engineering (full labeled data) ---")
+    train_feat, coords = engineer_features(train_df)
+    val_feat, _ = engineer_features(val_df, city_coords=coords)
+    dec_feat, _ = engineer_features(dec_df, city_coords=coords)
+
+    fit_lane_target_encoding([train_feat, val_feat, dec_feat], target_col)
+    fit_categorical_codes([train_feat, val_feat, dec_feat], CAT_COLS)
 
     # Impute missing market index / quote signal for December inputs using December validation averages
     dec_market_avg = val_feat.loc[val_feat["month"] == 12, "market_index"].mean()
     dec_quote_avg = val_feat.loc[val_feat["month"] == 12, "quote_signal"].mean()
 
     for df_temp in [train_feat, val_feat, dec_feat]:
-        for c in feature_cols:
+        for c in FEATURE_COLS:
             if c not in df_temp.columns:
                 df_temp[c] = np.nan
 
     dec_feat["market_index"] = dec_feat["market_index"].fillna(dec_market_avg)
     dec_feat["quote_signal"] = dec_feat["quote_signal"].fillna(dec_quote_avg)
 
-    X_train = train_feat[feature_cols]
+    X_train = train_feat[FEATURE_COLS]
     y_train = train_feat[target_col]
-    X_val = val_feat[feature_cols]
-    X_dec = dec_feat[feature_cols]
+    X_val = val_feat[FEATURE_COLS]
+    X_dec = dec_feat[FEATURE_COLS]
 
-    # Only pass low-cardinality categorical indices (0, 1, 2)
-    cat_indices = [feature_cols.index(c) for c in cat_cols]
-
-    print("\n--- Training HistGradientBoostingRegressor ---")
-    model = HistGradientBoostingRegressor(
-        max_iter=500,
-        learning_rate=0.05,
-        max_depth=8,
-        categorical_features=cat_indices,
-        random_state=42,
-    )
+    print("\n--- Training Final HistGradientBoostingRegressor on all labeled data ---")
+    model = make_model()
     model.fit(X_train, y_train)
 
     print("\n--- Generating Predictions ---")
-    val_preds = np.clip(model.predict(X_val), a_min=1.0, a_max=None)
-    dec_preds = np.clip(model.predict(X_dec), a_min=1.0, a_max=None)
+    # Tree ensembles can't extrapolate trends past the training date range (Jan-Oct), so a
+    # small calendar-only correction (fit during holdout validation) is added back on top to
+    # recover realistic day-to-day/seasonal movement for the unseen Nov/Dec period.
+    val_preds = np.clip(
+        model.predict(X_val) + seasonal_model.predict(build_calendar_features(val_feat)),
+        a_min=1.0, a_max=None,
+    )
+    dec_preds = np.clip(
+        model.predict(X_dec) + seasonal_model.predict(build_calendar_features(dec_feat)),
+        a_min=1.0, a_max=None,
+    )
 
     # 1. Save validation_predictions.csv (exact format: load_id,predicted_rate)
     val_out = pd.DataFrame({
