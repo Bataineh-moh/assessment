@@ -1,38 +1,44 @@
-import os
-import sys
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
-from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 
+TARGET_COLUMN = "posted_rate"
+CATEGORY_COLUMNS = ["pickup", "delivery", "equipment"]
+FEATURE_COLUMNS = [
+    "pickup", "delivery", "equipment", "lane_avg_rate",
+    "distance", "log_distance", "weight",
+    "pickup_lat", "pickup_lon", "delivery_lat", "delivery_lon",
+    "month", "day", "dayofweek", "dayofyear", "is_weekend",
+    "sin_dayofyear", "cos_dayofyear",
+    "market_index", "quote_signal",
+]
+CATEGORY_COLUMN_POSITIONS = [FEATURE_COLUMNS.index(column) for column in CATEGORY_COLUMNS]
+
+
 def find_file(candidates: list[str]) -> Path | None:
-    """Checks current directory and a 'data/' subfolder for candidates."""
-    for c in candidates:
-        p = Path(c)
-        if p.exists():
-            return p
-        p_data = Path("data") / c
-        if p_data.exists():
-            return p_data
+    """Checks the current folder and the data/ folder for any of these file names."""
+    for name in candidates:
+        path = Path(name)
+        if path.exists():
+            return path
+        path_in_data = Path("data") / name
+        if path_in_data.exists():
+            return path_in_data
     return None
 
 
 def get_december_inputs() -> pd.DataFrame:
-    """Loads december inputs or auto-generates them according to score.py specifications."""
-    dec_path = find_file([
-        "december-chart-inputs.csv",
-        "december_chart_inputs.csv",
-        "data/december-chart-inputs.csv",
-        "data/december_chart_inputs.csv",
-    ])
+    """Loads the fixed December scenario, or builds it if the file isn't there yet."""
+    dec_path = find_file(["december_chart_inputs.csv", "december-chart-inputs.csv"])
     if dec_path is not None:
-        print(f"Loading dec from:   {dec_path}")
+        print(f"Loading December scenario from: {dec_path}")
         return pd.read_csv(dec_path)
 
-    print("december-chart-inputs.csv not found locally. Auto-generating fixed inputs according to score.py...")
+    print("December scenario file not found. Generating it from the assessment spec...")
     dates = pd.date_range("2025-12-01", "2025-12-31", freq="D").strftime("%Y-%m-%d")
     return pd.DataFrame({
         "pickup": "Lexington",
@@ -46,13 +52,14 @@ def get_december_inputs() -> pd.DataFrame:
 
 
 def load_datasets():
+    """Loads the training data, the validation data, and the December scenario."""
     train_path = find_file(["train-test.csv", "train_test.csv"])
     val_path = find_file(["validation.csv"])
 
     if train_path is None:
-        raise FileNotFoundError("Could not find train-test.csv in root or data/ folder.")
+        raise FileNotFoundError("Could not find train-test.csv in the data/ folder.")
     if val_path is None:
-        raise FileNotFoundError("Could not find validation.csv in root or data/ folder.")
+        raise FileNotFoundError("Could not find validation.csv in the data/ folder.")
 
     print(f"Loading train from: {train_path}")
     print(f"Loading val from:   {val_path}")
@@ -64,14 +71,8 @@ def load_datasets():
     return train_df, val_df, dec_df
 
 
-def engineer_features(df: pd.DataFrame, city_coords: dict = None) -> tuple[pd.DataFrame, dict]:
-    data = df.copy()
-
-    # 1. Clean data-quality issues: fix negative weights (e.g. sign flip error)
-    if "weight" in data.columns:
-        data["weight"] = data["weight"].abs()
-
-    # 2. Date and time-based features
+def add_date_features(data: pd.DataFrame) -> pd.DataFrame:
+    """Breaks the date column into pieces the model can use."""
     dates = pd.to_datetime(data["date"])
     data["month"] = dates.dt.month
     data["day"] = dates.dt.day
@@ -79,79 +80,81 @@ def engineer_features(df: pd.DataFrame, city_coords: dict = None) -> tuple[pd.Da
     data["dayofyear"] = dates.dt.dayofyear
     data["is_weekend"] = dates.dt.dayofweek.isin([5, 6]).astype(int)
 
-    # Cyclical seasonal features
+    # sin/cos of the day-of-year lets the model see that Dec 31 and Jan 1 are
+    # right next to each other, instead of being the two opposite ends of a number line.
     data["sin_dayofyear"] = np.sin(2 * np.pi * data["dayofyear"] / 365.25)
     data["cos_dayofyear"] = np.cos(2 * np.pi * data["dayofyear"] / 365.25)
+    return data
 
-    # 3. Impute coordinates for inputs lacking lat/lon
-    if city_coords is None:
-        pickup_map = data.groupby("pickup")[["pickup_lat", "pickup_lon"]].mean().to_dict(orient="index")
-        delivery_map = data.groupby("delivery")[["delivery_lat", "delivery_lon"]].mean().to_dict(orient="index")
-        city_coords = {"pickup": pickup_map, "delivery": delivery_map}
 
+def get_city_coordinates(data: pd.DataFrame) -> dict:
+    """Averages the known pickup/delivery coordinates for each city."""
+    pickup_coords = data.groupby("pickup")[["pickup_lat", "pickup_lon"]].mean().to_dict(orient="index")
+    delivery_coords = data.groupby("delivery")[["delivery_lat", "delivery_lon"]].mean().to_dict(orient="index")
+    return {"pickup": pickup_coords, "delivery": delivery_coords}
+
+
+def fill_missing_coordinates(data: pd.DataFrame, city_coords: dict) -> pd.DataFrame:
+    """Looks up coordinates by city for rows that don't already have them
+    (only the made-up December scenario needs this)."""
     if "pickup_lat" not in data.columns:
-        data["pickup_lat"] = data["pickup"].map(lambda x: city_coords["pickup"].get(x, {}).get("pickup_lat", np.nan))
-        data["pickup_lon"] = data["pickup"].map(lambda x: city_coords["pickup"].get(x, {}).get("pickup_lon", np.nan))
+        data["pickup_lat"] = data["pickup"].map(lambda city: city_coords["pickup"].get(city, {}).get("pickup_lat", np.nan))
+        data["pickup_lon"] = data["pickup"].map(lambda city: city_coords["pickup"].get(city, {}).get("pickup_lon", np.nan))
     if "delivery_lat" not in data.columns:
-        data["delivery_lat"] = data["delivery"].map(lambda x: city_coords["delivery"].get(x, {}).get("delivery_lat", np.nan))
-        data["delivery_lon"] = data["delivery"].map(lambda x: city_coords["delivery"].get(x, {}).get("delivery_lon", np.nan))
+        data["delivery_lat"] = data["delivery"].map(lambda city: city_coords["delivery"].get(city, {}).get("delivery_lat", np.nan))
+        data["delivery_lon"] = data["delivery"].map(lambda city: city_coords["delivery"].get(city, {}).get("delivery_lon", np.nan))
+    return data
 
-    # 4. Domain features
+
+def engineer_features(df: pd.DataFrame, city_coords: dict = None) -> tuple[pd.DataFrame, dict]:
+    """Cleans the data and adds the extra columns the model needs (dates, coordinates, lane name)."""
+    data = df.copy()
+
+    # A handful of rows have a negative weight, which looks like a data-entry mistake, not a
+    # real empty truck. Taking the absolute value fixes the sign without dropping the row.
+    if "weight" in data.columns:
+        data["weight"] = data["weight"].abs()
+
+    data = add_date_features(data)
+
+    if city_coords is None:
+        city_coords = get_city_coordinates(data)
+    data = fill_missing_coordinates(data, city_coords)
+
     data["log_distance"] = np.log1p(data["distance"])
     data["lane_name"] = data["pickup"].astype(str) + " -> " + data["delivery"].astype(str)
 
     return data, city_coords
 
 
-TARGET_COL = "posted_rate"
-CAT_COLS = ["pickup", "delivery", "equipment"]
-FEATURE_COLS = [
-    "pickup", "delivery", "equipment", "lane_target_enc",
-    "distance", "log_distance", "weight",
-    "pickup_lat", "pickup_lon", "delivery_lat", "delivery_lon",
-    "month", "day", "dayofweek", "dayofyear", "is_weekend",
-    "sin_dayofyear", "cos_dayofyear",
-    "market_index", "quote_signal",
-]
-CAT_INDICES = [FEATURE_COLS.index(c) for c in CAT_COLS]
-
-# Heavy regularization: the out-of-fold calendar signal is weak (residual R^2 << 1%),
-# so this keeps the correction a modest nudge instead of fitting holdout noise.
-SEASONAL_RIDGE_ALPHA = 50.0
+def get_lane_average_rates(train_df: pd.DataFrame, min_loads_for_full_trust: int = 10) -> tuple[dict, float]:
+    """
+    Works out the average historical rate for each pickup -> delivery lane.
+    A lane with only a few loads gets blended toward the overall average, so one
+    unusually cheap or expensive load doesn't swing that lane's number too much.
+    """
+    overall_average = train_df[TARGET_COLUMN].mean()
+    lane_stats = train_df.groupby("lane_name")[TARGET_COLUMN].agg(["count", "mean"])
+    blended_average = (
+        lane_stats["count"] * lane_stats["mean"] + min_loads_for_full_trust * overall_average
+    ) / (lane_stats["count"] + min_loads_for_full_trust)
+    return blended_average.to_dict(), overall_average
 
 
-def fit_lane_target_encoding(frames: list[pd.DataFrame], target_col: str, smoothing_weight: int = 10) -> None:
-    """Fits smoothed target encoding on frames[0] (the training frame) and applies it to all frames in place."""
-    train_frame = frames[0]
-    global_mean = train_frame[target_col].mean()
-    lane_stats = train_frame.groupby("lane_name")[target_col].agg(["count", "mean"])
-    smoothed_lane_rates = (
-        (lane_stats["count"] * lane_stats["mean"] + smoothing_weight * global_mean)
-        / (lane_stats["count"] + smoothing_weight)
-    ).to_dict()
-    for frame in frames:
-        frame["lane_target_enc"] = frame["lane_name"].map(smoothed_lane_rates).fillna(global_mean)
+def get_category_type(dataframes: list[pd.DataFrame], column: str) -> pd.CategoricalDtype:
+    """Collects every value seen for one column across all the given dataframes,
+    so the same category always gets the same code in every dataset."""
+    values = set()
+    for df in dataframes:
+        values.update(df[column].dropna().unique())
+    return pd.CategoricalDtype(categories=sorted(values))
 
 
-def fit_categorical_codes(frames: list[pd.DataFrame], cat_cols: list[str]) -> None:
-    """Encodes low-cardinality categoricals using a category set shared across all frames, in place."""
-    for col in cat_cols:
-        all_categories = sorted(set().union(*(set(f[col].dropna().unique()) for f in frames)))
-        cat_type = pd.CategoricalDtype(categories=all_categories)
-        for frame in frames:
-            frame[col] = frame[col].astype(cat_type).cat.codes
-
-
-def build_calendar_features(data: pd.DataFrame) -> pd.DataFrame:
-    """Bounded cyclical-only features (day-of-week + day-of-year sin/cos) for the seasonal
-    residual correction. Unlike raw day indices, sin/cos stay in [-1, 1] for any future date,
-    so a linear model on these extrapolates safely past the training date range."""
-    return pd.DataFrame({
-        "sin_dow": np.sin(2 * np.pi * data["dayofweek"] / 7),
-        "cos_dow": np.cos(2 * np.pi * data["dayofweek"] / 7),
-        "sin_doy": data["sin_dayofyear"],
-        "cos_doy": data["cos_dayofyear"],
-    })
+def fill_missing_column(df: pd.DataFrame, column: str, fallback_value: float) -> None:
+    """Creates the column if it doesn't exist yet, then fills any blanks with fallback_value."""
+    if column not in df.columns:
+        df[column] = np.nan
+    df[column] = df[column].fillna(fallback_value)
 
 
 def compute_regression_metrics(y_true: pd.Series, y_pred: np.ndarray) -> dict:
@@ -168,96 +171,102 @@ def make_model() -> HistGradientBoostingRegressor:
         max_iter=500,
         learning_rate=0.05,
         max_depth=8,
-        categorical_features=CAT_INDICES,
+        categorical_features=CATEGORY_COLUMN_POSITIONS,
         random_state=42,
     )
 
 
-def run_temporal_holdout_validation(train_df: pd.DataFrame, target_col: str, holdout_months: int = 2) -> Ridge:
-    """Trains on the earliest months and holds out the most recent ones, mirroring the real
-    task of predicting Nov/Dec from Jan-Oct history. Prints out-of-sample metrics, then fits a
-    small seasonal-correction model on the holdout residuals (see build_calendar_features)."""
+def add_model_columns(train_df: pd.DataFrame, other_dfs: list[pd.DataFrame]) -> None:
+    """
+    Adds the lane-average-rate column and turns the text columns into numbers.
+    Everything is learned from train_df only, then applied to the other
+    dataframes, so validation/December data can't leak into those numbers.
+    """
+    all_dfs = [train_df] + other_dfs
+    lane_rates, overall_average = get_lane_average_rates(train_df)
+    for df in all_dfs:
+        df["lane_avg_rate"] = df["lane_name"].map(lane_rates).fillna(overall_average)
+
+    for column in CATEGORY_COLUMNS:
+        category_type = get_category_type(all_dfs, column)
+        for df in all_dfs:
+            df[column] = df[column].astype(category_type).cat.codes
+
+
+def validate_with_holdout(train_df: pd.DataFrame, holdout_months: int = 2) -> None:
+    """
+    Trains on the earlier months and tests on the most recent ones, which mirrors
+    the real task: predicting Nov/Dec using only Jan-Oct history. This gives an
+    honest estimate of how accurate the model is on data it hasn't seen before.
+    """
     dates = pd.to_datetime(train_df["date"])
-    months_sorted = sorted(dates.dt.to_period("M").unique())
-    holdout_set = set(months_sorted[-holdout_months:])
-    is_holdout = dates.dt.to_period("M").isin(holdout_set)
+    all_months = sorted(dates.dt.to_period("M").unique())
+    holdout_months_list = all_months[-holdout_months:]
+    is_holdout = dates.dt.to_period("M").isin(holdout_months_list)
 
     fold_train, fold_coords = engineer_features(train_df.loc[~is_holdout].copy())
     fold_holdout, _ = engineer_features(train_df.loc[is_holdout].copy(), city_coords=fold_coords)
-
-    fit_lane_target_encoding([fold_train, fold_holdout], target_col)
-    fit_categorical_codes([fold_train, fold_holdout], CAT_COLS)
+    add_model_columns(fold_train, [fold_holdout])
 
     model = make_model()
-    model.fit(fold_train[FEATURE_COLS], fold_train[target_col])
-    holdout_pred = np.clip(model.predict(fold_holdout[FEATURE_COLS]), a_min=1.0, a_max=None)
+    model.fit(fold_train[FEATURE_COLUMNS], fold_train[TARGET_COLUMN])
+    holdout_predictions = np.clip(model.predict(fold_holdout[FEATURE_COLUMNS]), a_min=1.0, a_max=None)
 
-    metrics = compute_regression_metrics(fold_holdout[target_col], holdout_pred)
-    print(
-        f"Holdout = {sorted(str(m) for m in holdout_set)}  "
-        f"(train={len(fold_train):,} rows, holdout={len(fold_holdout):,} rows)"
-    )
+    metrics = compute_regression_metrics(fold_holdout[TARGET_COLUMN], holdout_predictions)
+    print(f"Holdout months: {[str(month) for month in holdout_months_list]}")
+    print(f"Trained on {len(fold_train):,} rows, tested on {len(fold_holdout):,} rows")
     print(
         f"MAE=${metrics['MAE']:.2f}  RMSE=${metrics['RMSE']:.2f}  "
         f"R2={metrics['R2']:.4f}  MAPE={metrics['MAPE%']:.2f}%"
     )
 
-    residual = fold_holdout[target_col].to_numpy() - holdout_pred
-    seasonal_model = Ridge(alpha=SEASONAL_RIDGE_ALPHA)
-    seasonal_model.fit(build_calendar_features(fold_holdout), residual)
-    return seasonal_model
+
+def get_dayofweek_adjustment(train_df: pd.DataFrame) -> dict:
+    """Checks whether some days of the week historically run a bit above or below
+    average, so we have something to use for dates the model never trained on."""
+    dates = pd.to_datetime(train_df["date"])
+    rates_by_day = train_df.groupby(dates.dt.dayofweek)[TARGET_COLUMN].mean()
+    overall_average = train_df[TARGET_COLUMN].mean()
+    return (rates_by_day - overall_average).to_dict()
+
+
+def apply_dayofweek_adjustment(predictions: np.ndarray, df: pd.DataFrame, adjustment: dict) -> np.ndarray:
+    return predictions + df["dayofweek"].map(adjustment).fillna(0.0).to_numpy()
 
 
 def main():
     train_df, val_df, dec_df = load_datasets()
-    target_col = TARGET_COL
 
-    print("\n--- Temporal Holdout Validation (train on earlier months, test on most recent months) ---")
-    seasonal_model = run_temporal_holdout_validation(train_df, target_col)
+    print("\n--- Validating the model on data it hasn't seen (holdout) ---")
+    validate_with_holdout(train_df)
 
-    print("\n--- Feature Engineering (full labeled data) ---")
+    print("\n--- Checking for day-of-week patterns ---")
+    dayofweek_adjustment = get_dayofweek_adjustment(train_df)
+    print({day: round(amount, 2) for day, amount in dayofweek_adjustment.items()})
+
+    print("\n--- Preparing features on the full dataset ---")
     train_feat, coords = engineer_features(train_df)
     val_feat, _ = engineer_features(val_df, city_coords=coords)
     dec_feat, _ = engineer_features(dec_df, city_coords=coords)
+    add_model_columns(train_feat, [val_feat, dec_feat])
 
-    fit_lane_target_encoding([train_feat, val_feat, dec_feat], target_col)
-    fit_categorical_codes([train_feat, val_feat, dec_feat], CAT_COLS)
-
-    # Impute missing market index / quote signal for December inputs using December validation averages
+    # The December scenario doesn't come with market_index/quote_signal columns at all
+    # (it's a made-up lane), so fill both in using the real December average instead.
     dec_market_avg = val_feat.loc[val_feat["month"] == 12, "market_index"].mean()
     dec_quote_avg = val_feat.loc[val_feat["month"] == 12, "quote_signal"].mean()
+    fill_missing_column(dec_feat, "market_index", dec_market_avg)
+    fill_missing_column(dec_feat, "quote_signal", dec_quote_avg)
 
-    for df_temp in [train_feat, val_feat, dec_feat]:
-        for c in FEATURE_COLS:
-            if c not in df_temp.columns:
-                df_temp[c] = np.nan
-
-    dec_feat["market_index"] = dec_feat["market_index"].fillna(dec_market_avg)
-    dec_feat["quote_signal"] = dec_feat["quote_signal"].fillna(dec_quote_avg)
-
-    X_train = train_feat[FEATURE_COLS]
-    y_train = train_feat[target_col]
-    X_val = val_feat[FEATURE_COLS]
-    X_dec = dec_feat[FEATURE_COLS]
-
-    print("\n--- Training Final HistGradientBoostingRegressor on all labeled data ---")
+    print("\n--- Training the final model on all labeled data ---")
     model = make_model()
-    model.fit(X_train, y_train)
+    model.fit(train_feat[FEATURE_COLUMNS], train_feat[TARGET_COLUMN])
 
-    print("\n--- Generating Predictions ---")
-    # Tree ensembles can't extrapolate trends past the training date range (Jan-Oct), so a
-    # small calendar-only correction (fit during holdout validation) is added back on top to
-    # recover realistic day-to-day/seasonal movement for the unseen Nov/Dec period.
-    val_preds = np.clip(
-        model.predict(X_val) + seasonal_model.predict(build_calendar_features(val_feat)),
-        a_min=1.0, a_max=None,
-    )
-    dec_preds = np.clip(
-        model.predict(X_dec) + seasonal_model.predict(build_calendar_features(dec_feat)),
-        a_min=1.0, a_max=None,
-    )
+    print("\n--- Generating predictions ---")
+    val_preds = apply_dayofweek_adjustment(model.predict(val_feat[FEATURE_COLUMNS]), val_feat, dayofweek_adjustment)
+    dec_preds = apply_dayofweek_adjustment(model.predict(dec_feat[FEATURE_COLUMNS]), dec_feat, dayofweek_adjustment)
+    val_preds = np.clip(val_preds, a_min=1.0, a_max=None)
+    dec_preds = np.clip(dec_preds, a_min=1.0, a_max=None)
 
-    # 1. Save validation_predictions.csv (exact format: load_id,predicted_rate)
     val_out = pd.DataFrame({
         "load_id": val_df["load_id"],
         "predicted_rate": val_preds,
@@ -265,17 +274,11 @@ def main():
     val_out.to_csv("validation_predictions.csv", index=False)
     print("Saved -> validation_predictions.csv")
 
-    # 2. Save completed december inputs file (exact 7 columns)
     dec_out = dec_df.copy()
     dec_out["predicted_rate"] = dec_preds
-    dec_out_cols = ["pickup", "delivery", "distance", "equipment", "weight", "date", "predicted_rate"]
-    dec_out = dec_out[dec_out_cols]
-
-    dec_out.to_csv("december_chart_inputs.csv", index=False)
-    print("Saved -> december_chart_inputs.csv")
-    if Path("data").exists():
-        dec_out.to_csv("data/december_chart_inputs.csv", index=False)
-        print("Saved -> data/december_chart_inputs.csv")
+    dec_out = dec_out[["pickup", "delivery", "distance", "equipment", "weight", "date", "predicted_rate"]]
+    dec_out.to_csv("data/december_chart_inputs.csv", index=False)
+    print("Saved -> data/december_chart_inputs.csv")
 
 
 if __name__ == "__main__":

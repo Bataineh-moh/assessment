@@ -1,18 +1,33 @@
 # Freight Rate Prediction - Machine Learning Assessment
 
-This repository contains the end-to-end Machine Learning pipeline to predict freight shipping rates (`predicted_rate`) on spot market loads, evaluate temporal generalization, and generate batch predictions for production scoring.
+This repository predicts freight shipping rates (`predicted_rate`) for the loads in
+`data/validation.csv`, using `data/train-test.csv` as labeled training data.
 
 ---
 
-## 1. Project Overview & Architecture
-* **Model**: Histogram-based Gradient Boosting Regressor (`HistGradientBoostingRegressor`).
-* **Feature Engineering**: 
-  - Cyclical temporal encodings (day of year, day of week sine/cosine).
-  - Empirical Bayes smoothed target encoding for high-cardinality origin-destination lanes (4,000+ distinct pairs).
-  - Ton-mile domain interactions and log distance transforms.
-* **Data Quality Handling**: Rectified negative weight anomalies (sign-inversion errors) via absolute value correction and leveraged native missing-value routing for unobserved market indices and weights.
-* **Validation Strategy**: Temporal hold-out validation — the model is trained on the first 8 months of `train-test.csv` (Jan-Aug) and evaluated on the last 2 (Sep-Oct), the most recent data available, mirroring the real task of predicting the unseen Nov/Dec validation period. This step prints MAE/RMSE/R²/MAPE on every run before the final model is refit on all 10 labeled months.
-* **Seasonal Extrapolation Correction**: `train-test.csv` only covers Jan-Oct, so every date-derived feature is out of range for the Nov/Dec prediction window, and tree ensembles cannot extrapolate a trend past the feature range seen in training — they fall back to the nearest training-boundary leaf. To recover realistic day-to-day movement (most visible in the fixed December chart, which was flat before this fix), a small Ridge regression is fit on the holdout's out-of-sample residuals using only bounded cyclical features (sin/cos of day-of-week and day-of-year), then added on top of the tree's prediction for the validation and December sets. Because sine/cosine stay within [-1, 1] for any future date, this correction extrapolates smoothly instead of flatlining. The underlying signal is weak (holdout residual R² ≈ 0.001), so the correction is heavily regularized to stay a modest adjustment (a few percent) rather than fit holdout noise.
+## 1. Approach
+
+* **Model**: `HistGradientBoostingRegressor` from scikit-learn (a gradient-boosted tree model).
+  It handles missing values on its own and works well on tabular data like this without a lot
+  of tuning, which made it a good first choice here.
+* **Features used**: pickup/delivery city, equipment type, distance (and log of distance),
+  weight, pickup/delivery coordinates, market index, quote signal, the average historical rate
+  for that pickup -> delivery lane, and date-based features (month, day of week, day of year,
+  weekend flag, and sine/cosine of day-of-year so December 31st and January 1st are treated as
+  close together instead of far apart).
+* **Data cleaning**: a small number of rows had a negative `weight`, which looks like a data
+  entry mistake, so the sign is corrected. Missing `weight`/`market_index` values are left as-is
+  and handled natively by the model (it can split around missing values on its own).
+* **Validation**: trains on the first 8 months (Jan-Aug) and tests on the last 2 (Sep-Oct) of
+  `train-test.csv`, since that best mirrors the real task of predicting the following months
+  (Nov/Dec) from history. Prints MAE, RMSE, R², and MAPE on every run. After checking those
+  numbers look reasonable, the final model is retrained on all 10 labeled months so it has as
+  much data as possible for the actual predictions.
+* **December chart fix**: `train-test.csv` only has data through October, so the model has
+  never seen a December date and ends up predicting almost the same rate for every day in the
+  fixed December chart. To fix this, the code checks the historical data for simple day-of-week
+  patterns (e.g., are Tuesdays usually a bit higher than average?) and adds that small average
+  adjustment on top of the model's prediction. It's a simple lookup, not a second model.
 
 ---
 
@@ -30,7 +45,8 @@ pip install -r requirements.txt
 
 ## 3. Data Placement
 
-The raw data files are not committed to this repository (see `.gitignore`) and must be placed manually before running the pipeline:
+The raw data files are not committed to this repository (see `.gitignore`) and must be placed
+manually before running the pipeline:
 
 ```
 data/train-test.csv      # labeled development data (train_test.csv also accepted)
@@ -51,9 +67,10 @@ Run all commands from the repository root (`assessment/`).
 python pyfiles/train_and_predict.py
 ```
 
-This reads `data/train-test.csv` and `data/validation.csv`, trains the model, and writes:
+This reads `data/train-test.csv` and `data/validation.csv`, prints the validation metrics,
+trains the final model, and writes:
 * `validation_predictions.csv` — final `load_id,predicted_rate` predictions for all 12,000 validation loads.
-* `december_chart_inputs.csv` / `data/december_chart_inputs.csv` — the fixed Lexington → Fort Wayne scenario (one row per December day) with `predicted_rate` filled in.
+* `data/december_chart_inputs.csv` — the fixed Lexington → Fort Wayne scenario (one row per December day) with `predicted_rate` filled in.
 
 **Step 2 — Validate the outputs and generate the December chart:**
 
