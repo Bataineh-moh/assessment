@@ -20,7 +20,6 @@ CATEGORY_COLUMN_POSITIONS = [FEATURE_COLUMNS.index(column) for column in CATEGOR
 
 
 def find_file(candidates: list[str]) -> Path | None:
-    """Checks the current folder and the data/ folder for any of these file names."""
     for name in candidates:
         path = Path(name)
         if path.exists():
@@ -32,7 +31,6 @@ def find_file(candidates: list[str]) -> Path | None:
 
 
 def get_december_inputs() -> pd.DataFrame:
-    """Loads the fixed December scenario, or builds it if the file isn't there yet."""
     dec_path = find_file(["december_chart_inputs.csv", "december-chart-inputs.csv"])
     if dec_path is not None:
         print(f"Loading December scenario from: {dec_path}")
@@ -52,7 +50,6 @@ def get_december_inputs() -> pd.DataFrame:
 
 
 def load_datasets():
-    """Loads the training data, the validation data, and the December scenario."""
     train_path = find_file(["train-test.csv", "train_test.csv"])
     val_path = find_file(["validation.csv"])
 
@@ -72,7 +69,6 @@ def load_datasets():
 
 
 def add_date_features(data: pd.DataFrame) -> pd.DataFrame:
-    """Breaks the date column into pieces the model can use."""
     dates = pd.to_datetime(data["date"])
     data["month"] = dates.dt.month
     data["day"] = dates.dt.day
@@ -80,23 +76,18 @@ def add_date_features(data: pd.DataFrame) -> pd.DataFrame:
     data["dayofyear"] = dates.dt.dayofyear
     data["is_weekend"] = dates.dt.dayofweek.isin([5, 6]).astype(int)
 
-    # sin/cos of the day-of-year lets the model see that Dec 31 and Jan 1 are
-    # right next to each other, instead of being the two opposite ends of a number line.
     data["sin_dayofyear"] = np.sin(2 * np.pi * data["dayofyear"] / 365.25)
     data["cos_dayofyear"] = np.cos(2 * np.pi * data["dayofyear"] / 365.25)
     return data
 
 
 def get_city_coordinates(data: pd.DataFrame) -> dict:
-    """Averages the known pickup/delivery coordinates for each city."""
     pickup_coords = data.groupby("pickup")[["pickup_lat", "pickup_lon"]].mean().to_dict(orient="index")
     delivery_coords = data.groupby("delivery")[["delivery_lat", "delivery_lon"]].mean().to_dict(orient="index")
     return {"pickup": pickup_coords, "delivery": delivery_coords}
 
 
 def fill_missing_coordinates(data: pd.DataFrame, city_coords: dict) -> pd.DataFrame:
-    """Looks up coordinates by city for rows that don't already have them
-    (only the made-up December scenario needs this)."""
     if "pickup_lat" not in data.columns:
         data["pickup_lat"] = data["pickup"].map(lambda city: city_coords["pickup"].get(city, {}).get("pickup_lat", np.nan))
         data["pickup_lon"] = data["pickup"].map(lambda city: city_coords["pickup"].get(city, {}).get("pickup_lon", np.nan))
@@ -107,11 +98,8 @@ def fill_missing_coordinates(data: pd.DataFrame, city_coords: dict) -> pd.DataFr
 
 
 def engineer_features(df: pd.DataFrame, city_coords: dict = None) -> tuple[pd.DataFrame, dict]:
-    """Cleans the data and adds the extra columns the model needs (dates, coordinates, lane name)."""
     data = df.copy()
 
-    # A handful of rows have a negative weight, which looks like a data-entry mistake, not a
-    # real empty truck. Taking the absolute value fixes the sign without dropping the row.
     if "weight" in data.columns:
         data["weight"] = data["weight"].abs()
 
@@ -128,11 +116,6 @@ def engineer_features(df: pd.DataFrame, city_coords: dict = None) -> tuple[pd.Da
 
 
 def get_lane_average_rates(train_df: pd.DataFrame, min_loads_for_full_trust: int = 10) -> tuple[dict, float]:
-    """
-    Works out the average historical rate for each pickup -> delivery lane.
-    A lane with only a few loads gets blended toward the overall average, so one
-    unusually cheap or expensive load doesn't swing that lane's number too much.
-    """
     overall_average = train_df[TARGET_COLUMN].mean()
     lane_stats = train_df.groupby("lane_name")[TARGET_COLUMN].agg(["count", "mean"])
     blended_average = (
@@ -142,8 +125,6 @@ def get_lane_average_rates(train_df: pd.DataFrame, min_loads_for_full_trust: int
 
 
 def get_category_type(dataframes: list[pd.DataFrame], column: str) -> pd.CategoricalDtype:
-    """Collects every value seen for one column across all the given dataframes,
-    so the same category always gets the same code in every dataset."""
     values = set()
     for df in dataframes:
         values.update(df[column].dropna().unique())
@@ -151,7 +132,6 @@ def get_category_type(dataframes: list[pd.DataFrame], column: str) -> pd.Categor
 
 
 def fill_missing_column(df: pd.DataFrame, column: str, fallback_value: float) -> None:
-    """Creates the column if it doesn't exist yet, then fills any blanks with fallback_value."""
     if column not in df.columns:
         df[column] = np.nan
     df[column] = df[column].fillna(fallback_value)
@@ -177,11 +157,6 @@ def make_model() -> HistGradientBoostingRegressor:
 
 
 def add_model_columns(train_df: pd.DataFrame, other_dfs: list[pd.DataFrame]) -> None:
-    """
-    Adds the lane-average-rate column and turns the text columns into numbers.
-    Everything is learned from train_df only, then applied to the other
-    dataframes, so validation/December data can't leak into those numbers.
-    """
     all_dfs = [train_df] + other_dfs
     lane_rates, overall_average = get_lane_average_rates(train_df)
     for df in all_dfs:
@@ -194,11 +169,6 @@ def add_model_columns(train_df: pd.DataFrame, other_dfs: list[pd.DataFrame]) -> 
 
 
 def validate_with_holdout(train_df: pd.DataFrame, holdout_months: int = 2) -> None:
-    """
-    Trains on the earlier months and tests on the most recent ones, which mirrors
-    the real task: predicting Nov/Dec using only Jan-Oct history. This gives an
-    honest estimate of how accurate the model is on data it hasn't seen before.
-    """
     dates = pd.to_datetime(train_df["date"])
     all_months = sorted(dates.dt.to_period("M").unique())
     holdout_months_list = all_months[-holdout_months:]
@@ -222,8 +192,6 @@ def validate_with_holdout(train_df: pd.DataFrame, holdout_months: int = 2) -> No
 
 
 def get_dayofweek_adjustment(train_df: pd.DataFrame) -> dict:
-    """Checks whether some days of the week historically run a bit above or below
-    average, so we have something to use for dates the model never trained on."""
     dates = pd.to_datetime(train_df["date"])
     rates_by_day = train_df.groupby(dates.dt.dayofweek)[TARGET_COLUMN].mean()
     overall_average = train_df[TARGET_COLUMN].mean()
@@ -250,8 +218,6 @@ def main():
     dec_feat, _ = engineer_features(dec_df, city_coords=coords)
     add_model_columns(train_feat, [val_feat, dec_feat])
 
-    # The December scenario doesn't come with market_index/quote_signal columns at all
-    # (it's a made-up lane), so fill both in using the real December average instead.
     dec_market_avg = val_feat.loc[val_feat["month"] == 12, "market_index"].mean()
     dec_quote_avg = val_feat.loc[val_feat["month"] == 12, "quote_signal"].mean()
     fill_missing_column(dec_feat, "market_index", dec_market_avg)
