@@ -1,0 +1,8 @@
+train-test.csv
+train_test.csv
+validation.csv
+data/train-test.csv
+data/train_test.csv
+data/validation.csv
+__pycache__/
+.vscode/
